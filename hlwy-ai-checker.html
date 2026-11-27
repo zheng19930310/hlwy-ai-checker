@@ -1273,17 +1273,17 @@
                 <div class="quick-hero">
                     <h2>⚡ 一键鉴别</h2>
                     <div class="quick-steps">
-                        无需自己标定基准 —— 官方基准会自动从 GitHub 下载。<br>
+                        无需自己标定基准 —— 基础基准会自动载入，本地标定基准也可直接选择。<br>
                         <b>①</b> 选择你要鉴别的模型 &nbsp;→&nbsp;
                         <b>②</b> 填入渠道的 Base URL 和 API Key &nbsp;→&nbsp;
                         <b>③</b> 点击「开始一键鉴别」<br>
-                        报告会同时列出与所有官方基准的匹配度；若其他模型的匹配度比所选模型高出至少 0.5 个百分点，会提示可能被替换。
+                        报告会同时列出与所有基准的匹配度；若其他模型的匹配度比所选模型高出至少 0.5 个百分点，会提示可能被替换。
                     </div>
                 </div>
 
                 <div class="quick-model-row">
                     <div class="form-group">
-                        <label>① 选择模型（官方基准库）</label>
+                        <label>① 选择模型（基准库）</label>
                         <select id="quick-model-select" onchange="onQuickModelChange()">
                             <option value="">正在加载模型列表…</option>
                         </select>
@@ -1627,7 +1627,8 @@
                     <p style="text-align: center; color: #999; padding: 40px;">暂无基准数据，请先进行标定</p>
                 </div>
 
-                <button class="btn btn-secondary" onclick="exportBaselines()" style="margin-top: 20px;">📥 导出所有基准</button>
+                <button class="btn btn-secondary" id="load-builtin-baselines-btn" onclick="loadBuiltinBaselines()" style="margin-top: 20px;">📚 载入基础基准</button>
+                <button class="btn btn-secondary" onclick="exportBaselines()" style="margin-top: 20px; margin-left: 10px;">📥 导出所有基准</button>
                 <button class="btn btn-secondary" onclick="importBaselines()" style="margin-top: 20px; margin-left: 10px;">📤 导入基准</button>
                 <input type="file" id="import-file" style="display: none;" accept=".json" onchange="handleImport()">
             </div>
@@ -1635,10 +1636,10 @@
             <!-- 大横评 Tab -->
             <div id="compare" class="tab-content">
                 <h2>🏆 渠道大横评</h2>
-                <p style="color: #666; margin-bottom: 20px;">同时测试多个渠道（不同中转商的同一模型），与官方基准对比匹配度排名</p>
+                <p style="color: #666; margin-bottom: 20px;">同时测试多个渠道（不同中转商的同一模型），与基准对比匹配度排名</p>
 
                 <div class="form-group">
-                    <label>选择官方基准</label>
+                    <label>选择基准</label>
                     <select id="compare-baseline-select">
                         <option value="">-- 请先在「标定基准」中建立基准 --</option>
                     </select>
@@ -1710,6 +1711,7 @@
         const MAX_TEXT_LEN  = 200;
         const SECRET_PREFIX = 'enc:v1:';
         const KEY_MATERIAL_KEY = 'hlwy_key_material';
+        const BUILTIN_BASELINES_SEEDED_KEY = 'hlwy_builtin_baselines_seeded';
 
         /* 过滤不可信文本：按 Unicode 类别剔除控制字符与不可见格式字符
            （U+0000-U+001F、U+007F-U+009F、U+200B-U+200F、U+202A-U+202E、U+2060-U+206F、U+FEFF），
@@ -2620,7 +2622,7 @@
             return { text: '模型严重降智或者被偷换为其他模型', className: 'verdict-bad' };
         }
 
-        /* 其他官方基准须比所选模型高出至少这么多个百分点，才判为可能被替换 */
+        /* 其他基准须比所选模型高出至少这么多个百分点，才判为可能被替换 */
         const REPLACE_MARGIN_PCT = 0.5;
 
         /* 两个匹配度按展示值相减，单位为百分点；按 0.01 取整，避免浮点误差影响边界判断 */
@@ -2628,7 +2630,7 @@
             return Math.round((scoreToPct(a) - scoreToPct(b)) * 100) / 100;
         }
 
-        /* 一键鉴别结论：其他官方基准比所选模型高出 REPLACE_MARGIN_PCT 个百分点及以上，判为可能被替换 */
+        /* 一键鉴别结论：其他基准比所选模型高出 REPLACE_MARGIN_PCT 个百分点及以上，判为可能被替换 */
         function getQuickVerdict(claimedScore, bestOtherScore) {
             if (bestOtherScore != null && scoreGapPct(bestOtherScore, claimedScore) >= REPLACE_MARGIN_PCT) {
                 return { text: '模型可能被替换', className: 'verdict-bad', replaced: true };
@@ -2830,7 +2832,61 @@
             a.click();
         }
 
-        function importBaselines() { document.getElementById('import-file').click(); }
+        async function loadBuiltinBaselines({ silent = false } = {}) {
+            const button = document.getElementById('load-builtin-baselines-btn');
+            const originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = '载入中…';
+            try {
+                const response = await fetch('/api/baselines');
+                const payload = await response.json();
+                if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+
+                const results = await Promise.allSettled((payload.models || []).map(async model => {
+                    const baselineResponse = await fetch(`/api/baseline?name=${encodeURIComponent(model.id)}`);
+                    const baselinePayload = await baselineResponse.json();
+                    if (!baselineResponse.ok) throw new Error(baselinePayload.detail || baselinePayload.error || `HTTP ${baselineResponse.status}`);
+                    return normalizeDownloadedBaseline(baselinePayload.data);
+                }));
+
+                const existing = new Set(baselines.map(baseline => `${baseline.model}\n${baseline.timestamp}`));
+                let added = 0;
+                let failed = 0;
+                results.forEach(result => {
+                    if (result.status === 'rejected') {
+                        failed++;
+                        return;
+                    }
+                    const key = `${result.value.model}\n${result.value.timestamp}`;
+                    if (!existing.has(key)) {
+                        baselines.push(result.value);
+                        existing.add(key);
+                        added++;
+                    }
+                });
+                saveBaselines();
+                renderBaselines();
+                if (failed === 0) localStorage.setItem(BUILTIN_BASELINES_SEEDED_KEY, '1');
+                if (!silent) {
+                    alert(`基础基准载入完成：新增 ${added} 个，已有 ${results.length - failed - added} 个，失败 ${failed} 个。`);
+                }
+                return { added, failed, total: results.length };
+            } catch (error) {
+                if (!silent) alert(`载入基础基准失败：${error.message}`);
+                console.warn('载入基础基准失败:', error.message);
+                return null;
+            } finally {
+                button.disabled = false;
+                button.textContent = originalText;
+            }
+        }
+
+        async function seedBuiltinBaselines() {
+            if (localStorage.getItem(BUILTIN_BASELINES_SEEDED_KEY) === '1') return;
+            await loadBuiltinBaselines({ silent: true });
+        }
+
+    function importBaselines() { document.getElementById('import-file').click(); }
 
         function handleImport() {
             const file = document.getElementById('import-file').files[0];
@@ -3007,7 +3063,7 @@
         async function startCompare() {
             const baselineIdx = document.getElementById('compare-baseline-select').value;
             if (baselineIdx === '' || baselines.length === 0) {
-                showStatus('compare-status', '请先选择一个官方基准', 'error');
+                showStatus('compare-status', '请先选择一个基准', 'error');
                 return;
             }
             const selBaseline = baselines[parseInt(baselineIdx)];
@@ -3232,7 +3288,7 @@
         }
 
         /* ========================================
-         *  一键鉴别（自动下载官方基准 + 单模型报告）
+         *  一键鉴别（自动下载基准 + 单模型报告）
          * ======================================== */
         function escapeHtml(str) {
             return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({
@@ -3261,7 +3317,7 @@
 
             refresh.disabled = true;
             hint.className = 'quick-source-hint';
-            hint.textContent = '正在从 GitHub 获取官方基准列表…';
+            hint.textContent = '正在从 GitHub 获取基准列表…';
             const prevValue = sel.value;
             sel.innerHTML = '<option value="">正在加载模型列表…</option>';
 
@@ -3274,7 +3330,7 @@
                 if (quickModels.length === 0) {
                     sel.innerHTML = '<option value="">（基准库暂无模型）</option>';
                     hint.className = 'quick-source-hint err';
-                    hint.textContent = '官方基准库中暂时没有可用模型。';
+                    hint.textContent = '基准库中暂时没有可用模型。';
                     return;
                 }
 
@@ -3289,7 +3345,7 @@
                 if (prevValue && quickModels.some(m => m.id === prevValue)) sel.value = prevValue;
 
                 hint.className = 'quick-source-hint';
-                hint.textContent = `✅ 共 ${quickModels.length} 个官方基准模型（来源：${data.source}｜仓库：${data.repo}）`;
+                hint.textContent = `✅ 共 ${quickModels.length} 个基准模型（来源：${data.source}｜仓库：${data.repo}）`;
                 onQuickModelChange();
             } catch (err) {
                 sel.innerHTML = '<option value="">加载失败，请点击「刷新」重试</option>';
@@ -3325,7 +3381,7 @@
             return normalized;
         }
 
-        /* 下载一个官方基准，返回 { baseline, source } */
+        /* 下载一个基准，返回 { baseline, source } */
         async function fetchOfficialBaseline(id) {
             const resp = await fetch(`/api/baseline?name=${encodeURIComponent(id)}`);
             const payload = await resp.json();
@@ -3333,7 +3389,7 @@
             return { baseline: normalizeDownloadedBaseline(payload.data), source: payload.source || 'GitHub' };
         }
 
-        /* 下载其余官方基准用于横向比较；个别下载失败只跳过，不影响鉴别 */
+        /* 下载其余基准用于横向比较；个别下载失败只跳过，不影响鉴别 */
         async function fetchOtherBaselines(excludeId) {
             const ids = quickModels.map(m => m.id).filter(id => id !== excludeId);
             const settled = await Promise.allSettled(ids.map(id => fetchOfficialBaseline(id)));
@@ -3373,13 +3429,13 @@
             document.getElementById('quick-chart-container').style.display = 'none';
             document.getElementById('quick-progress-bar').classList.remove('show');
 
-            // ---- 步骤 1：下载官方基准 ----
+            // ---- 步骤 1：下载基准 ----
             let baseline, baselineSource;
-            showStatus('quick-status', `正在下载「${modelId}」的官方基准…`, 'info');
+            showStatus('quick-status', `正在载入「${modelId}」的基准…`, 'info');
             try {
                 ({ baseline, source: baselineSource } = await fetchOfficialBaseline(modelId));
             } catch (err) {
-                showStatus('quick-status', `❌ 下载官方基准失败：${err.message}`, 'error');
+                showStatus('quick-status', `❌ 载入基准失败：${err.message}`, 'error');
                 btn.disabled = false;
                 btn.textContent = '⚡ 开始一键鉴别';
                 return;
@@ -3387,7 +3443,7 @@
 
             const model = document.getElementById('quick-model-name').value.trim() || baseline.model || modelId;
 
-            // 其余官方基准在测试期间后台下载，出报告时用于横向比对
+            // 其余基准在测试期间后台下载，出报告时用于横向比对
             const othersPromise = fetchOtherBaselines(modelId);
 
             // ---- 步骤 2：测试待鉴别渠道 ----
@@ -3441,12 +3497,12 @@
                 return;
             }
 
-            // ---- 步骤 3：出报告，并与所有官方基准横向比对 ----
+            // ---- 步骤 3：出报告，并与所有基准横向比对 ----
             const distribution = calculateDistribution(results);
             const stats        = calculateStats(results);
             const similarity   = calculateSimilarity(distribution, baseline.distribution, stats, baseline.stats);
 
-            showStatus('quick-status', '正在与其他官方基准比对…', 'info');
+            showStatus('quick-status', '正在与其他基准比对…', 'info');
             const others = await othersPromise;
             const crossMatches = [{ id: modelId, baseline, similarity, isClaimed: true }]
                 .concat(others.loaded.map(o => ({
@@ -3472,7 +3528,7 @@
             }
         }
 
-        /* 一键鉴别报告：以所选模型为主，附带与所有官方基准的匹配度 */
+        /* 一键鉴别报告：以所选模型为主，附带与所有基准的匹配度 */
         function displayQuickResult(r) {
             const container = document.getElementById('quick-report');
             document.getElementById('quick-results').style.display = 'block';
@@ -3482,15 +3538,15 @@
             const verdict   = getQuickVerdict(score, bestOther ? bestOther.similarity.overallScore : null);
 
             const descMap = {
-                'verdict-good': '本次测试的随机数分布与官方基准高度一致，未发现被替换或明显降智的迹象。',
-                'verdict-warn': '分布与官方基准大体吻合，但存在一定偏差。可能只是采样波动，也可能存在轻微降智（如量化、参数被改动）。建议把测试次数调高后复测。',
-                'verdict-bad':  '分布与官方基准差异明显。该渠道可能并非其声称的模型，或存在严重降智。建议结合其他方法交叉验证后再下结论。'
+                'verdict-good': '本次测试的随机数分布与基准高度一致，未发现被替换或明显降智的迹象。',
+                'verdict-warn': '分布与基准大体吻合，但存在一定偏差。可能只是采样波动，也可能存在轻微降智（如量化、参数被改动）。建议把测试次数调高后复测。',
+                'verdict-bad':  '分布与基准差异明显。该渠道可能并非其声称的模型，或存在严重降智。建议结合其他方法交叉验证后再下结论。'
             };
 
             let verdictDesc = descMap[verdict.className];
             if (verdict.replaced) {
                 const gap = scoreGapPct(bestOther.similarity.overallScore, score);
-                verdictDesc = `本次分布与官方基准「${escapeHtml(bestOther.id)}」更像（${scoreToPct(bestOther.similarity.overallScore).toFixed(2)}%），`
+                verdictDesc = `本次分布与基准「${escapeHtml(bestOther.id)}」更像（${scoreToPct(bestOther.similarity.overallScore).toFixed(2)}%），`
                     + `比所选模型「${escapeHtml(r.modelId)}」高出 ${gap.toFixed(2)} 个百分点。该渠道可能把请求转给了其他模型。`
                     + '建议结合其他方法交叉验证后再下结论。';
             }
@@ -3511,7 +3567,7 @@
             let html = `
                 <div class="quick-verdict-card ${verdict.className}">
                     <div class="qv-score">${(score * 100).toFixed(2)}%</div>
-                    <div class="qv-label">与官方基准「${escapeHtml(r.modelId)}」的综合匹配度</div>
+                    <div class="qv-label">与基准「${escapeHtml(r.modelId)}」的综合匹配度</div>
                     <div class="qv-text">${escapeHtml(verdict.text)}</div>
                     <div class="qv-desc">${verdictDesc}</div>
                 </div>
@@ -3519,7 +3575,7 @@
                 <div class="quick-meta">
                     <b>鉴别对象：</b>${escapeHtml(r.modelId)}
                         （渠道上的模型名：<code>${escapeHtml(r.model)}</code>）<br>
-                    <b>官方基准：</b>${r.baseline.iterations || '?'} 个样本，标定于 ${baseTime}（来源：${escapeHtml(r.baselineSource)}）<br>
+                    <b>基准：</b>${r.baseline.iterations || '?'} 个样本，标定于 ${baseTime}（来源：${escapeHtml(r.baselineSource)}）<br>
                     <b>本次测试：</b>${sampleCount} 个有效样本 / 共 ${r.iterations} 次请求${r.errorCount > 0 ? `（${r.errorCount} 次失败）` : ''}<br>
                     <b>本次统计：</b>众数 ${r.stats.mode}，均值 ${r.stats.mean.toFixed(2)}，标准差 ${r.stats.stdDev.toFixed(2)}，唯一值 ${r.stats.unique} 个
                 </div>
@@ -3564,19 +3620,19 @@
             displayQuickChart(r.distribution, r.baseline.distribution, r.model, r.modelId);
         }
 
-        /* 与所有官方基准的匹配度排名 */
+        /* 与所有基准的匹配度排名 */
         function renderCrossMatches(r) {
-            let html = `<div class="compare-section-title">与所有官方基准的匹配度</div>`;
+            let html = `<div class="compare-section-title">与所有基准的匹配度</div>`;
 
             if (r.crossMatches.length < 2) {
                 html += `<div class="quick-meta" style="border-left-color:#bbb;">
-                    未能获取其他官方基准，本次只和所选模型做了比较。${r.crossFailed.length ? `下载失败：${r.crossFailed.map(escapeHtml).join('、')}。` : ''}
+                    未能获取其他基准，本次只和所选模型做了比较。${r.crossFailed.length ? `下载失败：${r.crossFailed.map(escapeHtml).join('、')}。` : ''}
                 </div>`;
                 return html;
             }
 
             html += `<div class="table-scroll"><table class="ranking-table"><thead><tr>
-                <th>排名</th><th>官方基准</th><th>综合匹配度</th><th>众数</th><th>余弦相似度</th><th>JS散度</th>
+                <th>排名</th><th>基准</th><th>综合匹配度</th><th>众数</th><th>余弦相似度</th><th>JS散度</th>
             </tr></thead><tbody>`;
 
             r.crossMatches.forEach((m, i) => {
@@ -3637,7 +3693,7 @@
                     labels,
                     datasets: [
                         { label: `本次测试: ${testName}`, data: testBuckets, backgroundColor: 'rgba(37, 99, 235, 0.55)', borderColor: 'rgba(37, 99, 235, 1)', borderWidth: 1 },
-                        { label: `官方基准: ${baselineName}`, data: baselineBuckets, backgroundColor: 'rgba(139, 148, 158, 0.5)', borderColor: 'rgba(110, 118, 129, 1)', borderWidth: 1 }
+                        { label: `基准: ${baselineName}`, data: baselineBuckets, backgroundColor: 'rgba(139, 148, 158, 0.5)', borderColor: 'rgba(110, 118, 129, 1)', borderWidth: 1 }
                     ]
                 },
                 options: {
@@ -3674,7 +3730,9 @@
             // 填充各页的「已存 API 配置」下拉框
             refreshAllProfileSelects();
 
-            // 默认页面：自动加载官方基准列表
+            seedBuiltinBaselines();
+
+            // 默认页面：自动加载基准列表
             loadQuickModels();
 
             // 「含测试版」开关（挂在标题栏「检查更新」旁）

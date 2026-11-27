@@ -236,7 +236,11 @@ def fetch_baseline_list(force=False):
     with _baseline_lock:
         cached = _baseline_cache['list']
         if not force and cached and (now - _baseline_cache['list_ts']) < BASELINE_LIST_TTL:
-            return cached, _baseline_cache['list_source'] + '(缓存)'
+            models, added = _merge_local_baselines(cached)
+            source = _baseline_cache['list_source']
+            if added:
+                source += ' + 本地标定'
+            return models, source + '(缓存)'
 
     errors = []
 
@@ -306,7 +310,29 @@ def _parse_index(data):
     return models
 
 
+def _merge_local_baselines(models):
+    try:
+        with open(os.path.join(SCRIPT_DIR, BASELINE_DIR, BASELINE_INDEX), 'r', encoding='utf-8') as f:
+            local_models = _parse_index(json.load(f))
+    except Exception:
+        local_models = []
+
+    merged = list(models)
+    seen = {model['id'] for model in merged}
+    added = False
+    for model in local_models:
+        path = os.path.join(SCRIPT_DIR, BASELINE_DIR, model['file'])
+        if model['id'] not in seen and os.path.isfile(path):
+            merged.append(model)
+            seen.add(model['id'])
+            added = True
+    return merged, added
+
+
 def _store_list(models, source):
+    models, added = _merge_local_baselines(models)
+    if added:
+        source += ' + 本地标定'
     models.sort(key=lambda m: m['id'].lower())
     with _baseline_lock:
         _baseline_cache['list']        = models
@@ -327,9 +353,13 @@ def load_disk_cache():
     models = _parse_index(raw.get('list') or [])
     if not models:
         return
+    models, added = _merge_local_baselines(models)
+    source = raw.get('list_source') or 'GitHub'
+    if added:
+        source += ' + 本地标定'
     with _baseline_lock:
         _baseline_cache['list']        = models
-        _baseline_cache['list_source'] = raw.get('list_source') or 'GitHub'
+        _baseline_cache['list_source'] = source
         _baseline_cache['list_ts']     = float(raw.get('list_ts') or 0)
 
 
@@ -355,6 +385,11 @@ def fetch_baseline_file(name, force=False):
     """从 raw.githubusercontent 下载单个基准文件。返回 (data, source)"""
     if not _SAFE_NAME_RE.match(name):
         raise ValueError('基准名称不合法')
+
+    local_path = os.path.join(SCRIPT_DIR, BASELINE_DIR, f'{name}.json')
+    if os.path.isfile(local_path):
+        with open(local_path, 'r', encoding='utf-8') as f:
+            return json.load(f), '本地基准文件'
 
     now = time.time()
     with _baseline_lock:
